@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 import os, sys, time, math, random, argparse, statistics
 from typing import List, Tuple
@@ -21,7 +20,6 @@ def rss_mb() -> float:
     else:
         return kb / 1024.0
 
-
 def make_data(n: int, seed: int = 42) -> List[int]:
     random.seed(seed)
     return [random.randint(-10**9, 10**9) for _ in range(n)]
@@ -33,7 +31,7 @@ def split_chunks(a: List[int], k: int) -> List[List[int]]:
     size = math.ceil(n / k)
     return [a[i:i+size] for i in range(0, n, size)]
 
-# Merge Sort
+# mergesort
 def merge(left: List[int], right: List[int]) -> List[int]:
     out, i, j = [], 0, 0
     while i < len(left) and j < len(right):
@@ -82,7 +80,7 @@ def sort_threaded(arr: List[int], workers: int) -> Tuple[List[int], float, float
     for t in threads: t.start()
     for t in threads: t.join()
 
-    # gather in order
+    # gather
     sorted_chunks = [None] * len(chunks)
     while not q.empty():
         i, chunk = q.get()
@@ -93,16 +91,32 @@ def sort_threaded(arr: List[int], workers: int) -> Tuple[List[int], float, float
     t1_mem = rss_mb()
     return out, (t1 - t0), (t1_mem - t0_mem if t1_mem >= 0 and t0_mem >= 0 else -1)
 
-#top level helpers for multiprocessing
+# mp helpers
 def _proc_sort_mapper(idx: int, data, q):
     q.put((idx, mergesort(data)))
 
 def _proc_max_mapper(data, shared_max, lock):
     local_m = max(data) if data else -10**10
-    # read -> compare -> conditional write under synchronization
+    # read/compare/write
     with lock:
         if local_m > shared_max.value:
             shared_max.value = local_m
+
+# unsafe mapper
+def _proc_max_mapper_unsafe(data, shared_max):
+    local_m = max(data) if data else -10**10
+    # race-prone
+    if local_m > shared_max.value:
+        shared_max.value = local_m
+
+# unsafe stress mapper
+def _proc_stress_mapper_unsafe(d, shared_max, jitter_prob: float, jitter_max_ms: float):
+    import random, time as _time
+    local_m = max(d) if d else -10**10
+    if random.random() < jitter_prob:
+        _time.sleep(random.uniform(0.0, jitter_max_ms) / 1000.0)
+    if local_m > shared_max.value:
+        shared_max.value = local_m
 
 def sort_process(arr: List[int], workers: int) -> Tuple[List[int], float, float]:
     import multiprocessing as mp
@@ -123,7 +137,7 @@ def sort_process(arr: List[int], workers: int) -> Tuple[List[int], float, float]
 
     sorted_chunks = [None] * len(chunks)
     for _ in range(len(chunks)):
-        i, chunk = q.get()  # this unblocks children as we consume
+        i, chunk = q.get()  # drain queue
         sorted_chunks[i] = chunk
 
     for p in procs:
@@ -156,6 +170,36 @@ def max_threaded(arr: List[int], workers: int) -> Tuple[int, float]:
     t1 = time.perf_counter()
     return global_max[0], (t1 - t0)
 
+def max_threaded_unsafe(arr, workers):
+    from threading import Thread
+    chunks = split_chunks(arr, workers)
+    global_max = [-10**10]  # no lock
+    t0 = time.perf_counter()
+    def mapper(data):
+        local_m = max(data) if data else -10**10
+        # race-prone
+        if local_m > global_max[0]:
+            global_max[0] = local_m
+    threads = [Thread(target=mapper, args=(c,)) for c in chunks]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    t1 = time.perf_counter()
+    return global_max[0], (t1 - t0)
+
+def max_process_unsafe(arr, workers):
+    from multiprocessing import Value, set_start_method, get_context
+    try: set_start_method("spawn")
+    except RuntimeError: pass
+    ctx = get_context("spawn")
+    shared_max = Value('q', -10**10, lock=False)  # no lock
+    chunks = split_chunks(arr, workers)
+    t0 = time.perf_counter()
+    procs = [ctx.Process(target=_proc_max_mapper_unsafe, args=(c, shared_max)) for c in chunks]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    t1 = time.perf_counter()
+    return int(shared_max.value), (t1 - t0)
+
 def max_process(arr: List[int], workers: int) -> Tuple[int, float]:
     from multiprocessing import Process, Value, Lock, set_start_method
     try:
@@ -179,7 +223,6 @@ def max_process(arr: List[int], workers: int) -> Tuple[int, float]:
 def is_sorted(a: List[int]) -> bool:
     return all(a[i] <= a[i+1] for i in range(len(a)-1))
 
-
 def run_bench():
     sizes = [32, 131072]
     worker_sets = [1, 2, 4, 8]
@@ -197,7 +240,7 @@ def run_bench():
         golden_max = max(data) if data else None
         for workers in worker_sets:
             for name, fn in modes:
-                # run 3 trials and take median time
+                # median of 3
                 times, mems = [], []
                 out_extra = ""
                 for _ in range(3):
@@ -215,10 +258,61 @@ def run_bench():
                 mmed = statistics.median([x for x in mems if x >= 0]) if any(x>=0 for x in mems) else -1.0
                 print(f"{name},{n},{workers},{tmed:.6f},{mmed:.3f},{out_extra}")
 
+# sync stress test
+def sync_stress(trials=100, size=32768, workers=32):
+    import random, time as _time
+    from multiprocessing import get_context, Value
+
+    data = make_data(size, 123)
+    correct = max(data)
+
+    def run_thread_unsafe_once():
+        # jitter + tiny chunks
+        chunks = split_chunks(data, workers)
+        global_max = [-10**10]
+        from threading import Thread
+        def mapper(d):
+            local_m = max(d) if d else -10**10
+            # jitter
+            if random.random() < 0.7:
+                _time.sleep(random.uniform(0, 0.002))
+            if local_m > global_max[0]:
+                global_max[0] = local_m
+        ts = [Thread(target=mapper, args=(c,)) for c in chunks]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        return global_max[0]
+
+    def run_proc_unsafe_once():
+        # spawn-safe
+        ctx = get_context("spawn")
+        shared_max = Value('q', -10**10, lock=False)
+        chunks = split_chunks(data, workers)
+        ps = [ctx.Process(target=_proc_stress_mapper_unsafe,
+                          args=(c, shared_max, 0.7, 2.0))
+              for c in chunks]
+        for p in ps: p.start()
+        for p in ps: p.join()
+        return int(shared_max.value)
+
+    wrong_thread = wrong_proc = 0
+    t0 = _time.perf_counter()
+    for _ in range(trials):
+        if run_thread_unsafe_once() != correct:
+            wrong_thread += 1
+    t1 = _time.perf_counter()
+    for _ in range(trials):
+        if run_proc_unsafe_once() != correct:
+            wrong_proc += 1
+    t2 = _time.perf_counter()
+    print(f"[sync-stress] trials={trials}, size={size}, workers={workers}")
+    print(f"  thread-UNSAFE wrong={wrong_thread}/{trials} (time={t1-t0:.3f}s)")
+    print(f"  process-UNSAFE wrong={wrong_proc}/{trials} (time={t2-t1:.3f}s)")
+
 # CLI
 def main():
     ap = argparse.ArgumentParser(description="MapReduce-style OS project (threads & processes)")
-    ap.add_argument("mode", choices=["sort-thread","sort-proc","max-thread","max-proc","bench"])
+    ap.add_argument("mode", choices=["sort-thread","sort-proc","max-thread","max-proc","bench","sync-test","sync-stress"])
     ap.add_argument("--size", type=int, default=131072, help="array length (default: 131072)")
     ap.add_argument("--workers", type=int, default=4, help="number of mapper workers (default: 4)")
     ap.add_argument("--seed", type=int, default=42)
@@ -226,6 +320,25 @@ def main():
 
     if args.mode == "bench":
         run_bench()
+        return
+
+    if args.mode == "sync-test":
+        data = make_data(args.size, args.seed)
+        print("\n--- Synchronization Performance Comparison ---")
+        print(f"(size={args.size}, workers=8 for max tests; threads/processes use same data)")
+        for name, fn in [
+            ("max-thread SAFE",   lambda: max_threaded(data, 8)),
+            ("max-thread UNSAFE", lambda: max_threaded_unsafe(data, 8)),
+            ("max-proc SAFE",     lambda: max_process(data, 8)),
+            ("max-proc UNSAFE",   lambda: max_process_unsafe(data, 8)),
+        ]:
+            g, t = fn()
+            print(f"{name:22s} | time={t:.6f}s | global_max={g}")
+        return
+
+    if args.mode == "sync-stress":
+        # tweak as needed
+        sync_stress(trials=100, size=32768, workers=32)
         return
 
     data = make_data(args.size, args.seed)
